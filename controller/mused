@@ -1,0 +1,1114 @@
+#!/usr/bin/env python3
+"""mused: resident daemon, VM-side front for VPS /muse-api/ (no SSH).
+
+- Holds one resident WSS control channel to the VPS (OPT-03, Scheme A):
+  multiplexes all concurrent requests by req_id over a single
+  proxy-CONNECT + TLS 1.3 connection. Falls back to the HTTPS keep-alive
+  pool if WSS is unavailable.
+- Holds HTTPS keep-alive pool as fallback (CONNECT+TLS via the
+  egress proxy, SNI from config, cert verified against the VPS CA).
+- Listens on a unix socket for JSON requests:
+    {"token": "...", "method": "POST", "path": "/cmd", "body": {...}}
+  and forwards them to https://<vps>/muse-api/<path>, returning the
+  upstream response as JSON:
+    {"status": 200, "body": "<raw body text>"}
+- Heartbeat thread: GET /muse-api/status every heartbeat_interval seconds
+  (401 also proves the link). On failure, reconnect with exponential
+  backoff.
+
+Config: ~/.config/mused/config.json
+  {vps_host, vps_port, sni, ca_cert_path, token_file, socket_path,
+   heartbeat_interval}
+Token: read from token_file (600), never in the config JSON.
+Logs: ~/.local/share/mused/mused.log (rotating, 10MB x 5).
+
+SIGTERM/SIGINT: graceful shutdown — close listener, drop upstream
+connection, remove the socket file.
+"""
+import asyncio
+import base64
+import http.client
+import json
+import logging
+import logging.handlers
+import os
+import random
+import re
+import signal
+import socket
+import ssl
+import struct
+import sys
+import threading
+import time
+import zlib
+from collections import OrderedDict
+from urllib.parse import urlparse
+
+# OPT-03: WSS multiplex (graceful degradation if websockets not installed)
+try:
+    from websockets.asyncio.client import connect as ws_connect
+    from websockets.exceptions import ConnectionClosed
+    _HAS_WEBSOCKETS = True
+except ImportError:
+    _HAS_WEBSOCKETS = False
+    ws_connect = None
+    ConnectionClosed = Exception
+
+try:
+    from microbatch import MicroBatcher, is_read_only
+except ImportError:  # running from an installed location without the module
+    MicroBatcher = None
+
+    def is_read_only(method, path, body):  # noqa: D103
+        return False
+
+try:
+    from tls_resume import ResumableHTTPSConnection, TLSSessionCache
+except ImportError:  # allow running as `python -m` from parent dir
+    from mused.tls_resume import ResumableHTTPSConnection, TLSSessionCache
+
+try:
+    from pool import ConnectionPool
+except ImportError:  # allow running as `python -m` from parent dir
+    from mused.pool import ConnectionPool
+
+try:
+    from compress import request_headers, response_encoding, decompress
+except ImportError:  # allow running as `python -m` from parent dir
+    from mused.compress import request_headers, response_encoding, decompress
+
+# ---------------------------------------------------------------- config
+
+HOME = os.path.expanduser("~")
+CONFIG_DIR = os.path.join(HOME, ".config", "mused")
+CONFIG_PATH = os.path.join(CONFIG_DIR, "config.json")
+LOG_DIR = os.path.join(HOME, ".local", "share", "mused")
+LOG_PATH = os.path.join(LOG_DIR, "mused.log")
+
+DEFAULTS = {
+    "vps_host": "${VPS_IP}",
+    "vps_port": 443,
+    "sni": "ai.vps38.local",
+    "ca_cert_path": os.path.join(
+        HOME, "workspace", "muse-bridge", "src", "muse", "vps-root-ca.pem"),
+    "token_file": os.path.join(CONFIG_DIR, "token"),
+    "socket_path": "/tmp/mused.sock",
+    "heartbeat_interval": 30,
+    "log_level": "INFO",
+    # Micro-batching (In-Flight Triggered Coalescing, see microbatch.py).
+    # OFF by default: the VPS must first implement the multiplexing
+    # POST /muse-api/batch wire format
+    #   {"batch_id":..., "requests":[{"id","method","path","body"},...]}
+    #   -> 200 [{"id","status","body"},...]
+    # which is NOT the legacy shell {"commands":[...]} batch.
+    "microbatch_enabled": False,
+    # Application-layer end-to-end compression (see compress.py, Gemini-4 §5.3).
+    # ON by default: payloads >= 2KB get zlib(level=1) with a
+    # "Content-Encoding: deflate" header; the VPS passes bytes through
+    # untouched. DEPLOYMENT NOTE: the PC plugin must implement the
+    # decompression side (DECOMPRESS_SPEC.md, Phase 2) BEFORE this is
+    # enabled in production, otherwise >2KB request bodies arrive at the
+    # PC as opaque deflate bytes. Flip to false until the plugin lands it.
+    "compress_enabled": True,
+}
+
+API_PREFIX = "/muse-api"
+TIMEOUT = 10
+BACKOFF_CAP = 30
+
+# length-prefixed framing on the unix socket: 4-byte big-endian length
+HDR = struct.Struct("!I")
+
+log = logging.getLogger("mused")
+
+# ------------------------------------------------- field-level decode (OPT-05 Phase 2)
+
+#: 插件字段级压缩的解压上限 (1MB)。muse-bridge 1.2.9+ 对 >=2KB 的
+#: stdout/stderr 字段做字段级压缩，信封格式:
+#:   {"enc": "zstd", "data": "<base64 of zstd frame>"}
+#: (+ 可选 "content_encoding" 提示)。解码是协议正确性、不是可选开关:
+#: 即使 config compress_enabled=False 也必须执行。
+FIELD_DECOMPRESS_MAX = 1 * 1024 * 1024
+#: 字段级解码递归深度上限 (防病态嵌套)。
+_FIELD_DECODE_MAX_DEPTH = 10
+
+
+def _decode_field_envelope(obj, _depth=0, _changed=None):
+    """解码插件字段级压缩 (插件 decodeInbound 的等价实现)。
+
+    递归遍历 dict/list，把压缩信封 {"enc": "zstd"|"deflate",
+    "data": "<base64>"} 还原为字符串。
+
+    优雅降级: 任何单字段解码失败都保留原对象 (debug 日志)，绝不抛异常。
+    zip 炸弹防护: 解压输出流式限流，上限 FIELD_DECOMPRESS_MAX。
+    """
+    if _changed is None:
+        _changed = []
+    if _depth > _FIELD_DECODE_MAX_DEPTH or obj is None:
+        return obj
+    if isinstance(obj, dict):
+        enc = obj.get("enc")
+        if enc in ("zstd", "deflate") and isinstance(obj.get("data"), str):
+            try:
+                raw = base64.b64decode("".join(obj["data"].split()),
+                                       validate=True)
+                plain = decompress(raw, enc, max_size=FIELD_DECOMPRESS_MAX)
+                text = plain.decode("utf-8")
+            except Exception as e:
+                log.debug("field-level decode failed, keeping envelope: %s",
+                          e)
+                return obj
+            _changed.append(True)
+            return text
+        return {k: _decode_field_envelope(v, _depth + 1, _changed)
+                for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_decode_field_envelope(v, _depth + 1, _changed)
+                for v in obj]
+    return obj
+
+
+def decode_field_compression(obj):
+    """对已解析的 JSON 响应做字段级解压 (dict/list/任意 JSON 值均可)。"""
+    return _decode_field_envelope(obj)
+
+
+def decode_field_compression_bytes(data):
+    """对响应体 bytes 做字段级解压；非 JSON 或无信封时原样返回。
+
+    无信封时返回原始 bytes (不重序列化)，避免扰动下游。
+    """
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError:
+        return data
+    try:
+        obj = json.loads(text)
+    except ValueError:
+        return data
+    changed = []
+    decoded = _decode_field_envelope(obj, 0, changed)
+    if not changed:
+        return data
+    try:
+        return json.dumps(decoded, ensure_ascii=False).encode("utf-8")
+    except (ValueError, TypeError):
+        return data
+
+
+def load_config():
+    cfg = dict(DEFAULTS)
+    try:
+        with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+            user = json.load(f)
+        if not isinstance(user, dict):
+            raise ValueError("config root must be an object")
+        for k, v in user.items():
+            if k in DEFAULTS:
+                cfg[k] = v
+            else:
+                log.warning("ignoring unknown config key: %s", k)
+    except FileNotFoundError:
+        log.info("no config at %s, using defaults", CONFIG_PATH)
+    except (json.JSONDecodeError, ValueError) as e:
+        log.error("bad config %s: %s -- using defaults", CONFIG_PATH, e)
+    # expand ~ in paths
+    for k in ("ca_cert_path", "token_file", "socket_path"):
+        cfg[k] = os.path.expanduser(cfg[k])
+    return cfg
+
+
+def setup_logging(log_level="INFO"):
+    os.makedirs(LOG_DIR, exist_ok=True)
+    level = getattr(logging, str(log_level).upper(), None)
+    if not isinstance(level, int):
+        print(f"warning: bad log_level {log_level!r}, using INFO",
+              file=sys.stderr)
+        level = logging.INFO
+    handler = logging.handlers.RotatingFileHandler(
+        LOG_PATH, maxBytes=10 * 1024 * 1024, backupCount=5,
+        encoding="utf-8")
+    fmt = logging.Formatter(
+        "%(asctime)s [%(levelname)s] %(threadName)s %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S")
+    handler.setFormatter(fmt)
+    root = logging.getLogger()
+    root.setLevel(level)
+    root.addHandler(handler)
+    # also echo to stderr so foreground runs stay visible;
+    # under systemd, stderr is captured by journald (dual logging)
+    console = logging.StreamHandler(sys.stderr)
+    console.setFormatter(fmt)
+    root.addHandler(console)
+
+
+# ---------------------------------------------------------------- upstream
+
+def parse_proxy():
+    raw = os.environ.get("https_proxy") or os.environ.get("HTTPS_PROXY")
+    if not raw:
+        raise RuntimeError("https_proxy / HTTPS_PROXY not set")
+    u = urlparse(raw)
+    auth = None
+    if u.username:
+        auth = base64.b64encode(
+            f"{u.username}:{u.password or ''}".encode()).decode()
+    return u.hostname, u.port or 3128, auth
+
+
+class ProxyHTTPSConnection(ResumableHTTPSConnection):
+    """HTTPSConnection tunneled through an HTTP CONNECT proxy, TLS SNI
+    independent of the destination IP (nginx routes on SNI).
+
+    Inherits TLS session resumption from ResumableHTTPSConnection: the
+    CONNECT tunnel is built first, then _tls_wrap() injects the cached
+    session. The fresh session is extracted in getresponse() (inherited),
+    never in connect() -- TLS 1.3 tickets arrive post-handshake.
+    """
+
+    def __init__(self, host, port=443, *, proxy_host, proxy_port,
+                 proxy_auth, sni, context, timeout=TIMEOUT,
+                 session_getter=None, session_setter=None,
+                 handshake_stats=None):
+        super().__init__(host, port, ssl_context=context,
+                         session_getter=session_getter,
+                         session_setter=session_setter,
+                         timeout=timeout)
+        self._proxy = (proxy_host, proxy_port)
+        self._proxy_auth = proxy_auth
+        self._sni = sni
+        self.connect_count = 0
+        if handshake_stats is not None:
+            self.attach_handshake_stats(handshake_stats)
+
+    def connect(self):
+        sock = socket.create_connection(self._proxy, timeout=self.timeout)
+        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        try:
+            req = (f"CONNECT {self.host}:{self.port} HTTP/1.1\r\n"
+                   f"Host: {self.host}:{self.port}\r\n")
+            if self._proxy_auth:
+                req += f"Proxy-Authorization: Basic {self._proxy_auth}\r\n"
+            req += "\r\n"
+            sock.sendall(req.encode("ascii"))
+            resp = b""
+            while b"\r\n\r\n" not in resp:
+                chunk = sock.recv(4096)
+                if not chunk:
+                    raise ConnectionError(
+                        "proxy closed connection during CONNECT")
+                resp += chunk
+                if len(resp) > 65536:
+                    raise ConnectionError("proxy CONNECT response too large")
+            status_line = resp.split(b"\r\n", 1)[0].decode("latin1")
+            if not (status_line.startswith("HTTP/1.1 200")
+                    or status_line.startswith("HTTP/1.0 200")):
+                raise ConnectionError(f"CONNECT rejected: {status_line}")
+            # TLS over the tunnel, with cached-session injection.
+            # (Never extract sock.session here -- TLS 1.3 ticket arrives later.)
+            self._tls_wrap(sock, self._sni)
+        except Exception:
+            sock.close()
+            raise
+        self.connect_count += 1
+
+
+# ---------------------------------------------------------------- OPT-03 WSS multiplex
+
+def _new_req_id():
+    """Generate a request ID matching the mb_ style."""
+    return f"mb_{int(time.time()*1000)}_{random.getrandbits(32):08x}"
+
+
+def _read_timeout_for(body, path=None):
+    """Per-request timeout: clamp(body.timeout,1,600)+5 (same T87 rule).
+
+    OPT-03: without an explicit body.timeout, /cmd//batch//file default to
+    65s (the PC-side default execution timeout is 60s + 5s margin). The old
+    flat 10s default made the WSS leg give up mid-command and blindly
+    re-dispatch over HTTPS, executing long commands twice.
+    """
+    if isinstance(body, dict):
+        try:
+            _t = body.get("timeout")
+            if _t is not None:
+                return min(max(int(_t), 1), 600) + 5
+        except (ValueError, TypeError):
+            pass
+    if path in ("/cmd", "/batch", "/file"):
+        return 65
+    return 10
+
+
+class WssMux:
+    """Single resident WSS control channel (OPT-03 Scheme A).
+
+    Runs its asyncio event loop in a dedicated background thread. The
+    synchronous `request()` method is thread-safe and can be called from
+    the Unix-socket worker threads via `asyncio.run_coroutine_threadsafe`.
+
+    On disconnect: fails pending futures fast, reconnects with exponential
+    backoff (1s -> 2s -> 4s ... capped at 30s).
+    """
+
+    WATCHDOG_SILENCE = 40  # > server PING_TIMEOUT (35s)
+    MAX_FRAME = 16 * 1024 * 1024
+
+    def __init__(self, cfg, token):
+        self._cfg = cfg
+        self._token = token
+        self._loop = None
+        self._thread = None
+        self._ws = None
+        self._pending = {}  # req_id -> asyncio.Future (loop thread only)
+        self._send_lock = None  # asyncio.Lock, created in loop thread
+        self._last_rx = 0.0
+        self._stop = None  # asyncio.Event, created in loop thread
+        self._reader_task = None
+        self._watchdog_task = None
+        self._ready = threading.Event()  # set when first connected
+        self._lock = threading.Lock()  # guards _ws for request()
+        self.reconnects = 0
+        self._shutdown = False
+
+    # -- public API (called from worker threads) --
+
+    def start(self):
+        """Start the background event loop thread."""
+        if not _HAS_WEBSOCKETS:
+            log.warning("websockets not installed, WSS multiplex disabled")
+            return
+        self._thread = threading.Thread(
+            target=self._run_loop, daemon=True, name="wss-mux")
+        self._thread.start()
+
+    def stop(self):
+        """Stop the background loop."""
+        self._shutdown = True
+        if self._loop and self._stop:
+            self._loop.call_soon_threadsafe(self._stop.set)
+        if self._thread:
+            self._thread.join(timeout=5)
+
+    def is_connected(self):
+        """True if the WSS channel is currently up."""
+        with self._lock:
+            return self._ws is not None
+
+    def wait_ready(self, timeout=10):
+        """Wait for the first successful connection."""
+        return self._ready.wait(timeout)
+
+    def request(self, method, path, body, timeout=None):
+        """Send one multiplexed request. Returns (status, body_bytes).
+
+        Thread-safe. Raises RuntimeError if WSS is not connected,
+        TimeoutError on per-request timeout.
+        """
+        if not _HAS_WEBSOCKETS:
+            raise RuntimeError("websockets not available")
+        with self._lock:
+            if self._ws is None:
+                raise RuntimeError("wss not connected")
+        # Submit to the loop thread and wait
+        fut = asyncio.run_coroutine_threadsafe(
+            self._async_request(method, path, body, timeout), self._loop)
+        # Use the caller's timeout + margin for the cross-thread wait
+        wait_to = (timeout or _read_timeout_for(body, path)) + 10
+        try:
+            return fut.result(timeout=wait_to)
+        except asyncio.TimeoutError:
+            raise TimeoutError("wss request cross-thread timeout")
+
+    # -- internal (loop thread) --
+
+    def _run_loop(self):
+        """Entry point for the background thread."""
+        self._loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(self._loop)
+        try:
+            self._loop.run_until_complete(self._run())
+        except Exception as e:
+            log.warning("wss mux loop exited: %s", e)
+        finally:
+            self._loop.close()
+
+    def _proxy_url(self):
+        return os.environ.get("https_proxy") or os.environ.get("HTTPS_PROXY")
+
+    def _tls_context(self):
+        ctx = ssl.create_default_context(cafile=self._cfg["ca_cert_path"])
+        ctx.check_hostname = True
+        return ctx
+
+    async def _connect_once(self):
+        """Establish one WSS connection + hello."""
+        uri = f"wss://{self._cfg['vps_host']}:{self._cfg['vps_port']}/muse-bridge"
+        kw = dict(open_timeout=20, ping_interval=None,
+                  max_size=self.MAX_FRAME)
+        self._ws = await ws_connect(
+            uri,
+            proxy=self._proxy_url(),
+            ssl=self._tls_context(),
+            server_hostname=self._cfg["sni"],
+            additional_headers={"X-Bridge-Token": self._token},
+            **kw)
+        hello = {
+            "type": "hello",
+            "client": "mused/4.0-wss",
+            "role": "controller",
+            "hostname": socket.gethostname(),
+            "platform": "linux",
+            "arch": "x64",
+        }
+        async with self._send_lock:
+            await self._ws.send(json.dumps(hello))
+        self._last_rx = time.time()
+        log.info("wss control channel connected: %s", uri)
+        self._ready.set()
+
+    async def _reader(self):
+        """Read loop: route api_response frames to pending futures."""
+        try:
+            async for raw in self._ws:
+                self._last_rx = time.time()
+                try:
+                    msg = json.loads(raw) if isinstance(raw, str) else None
+                except Exception:
+                    continue
+                if not isinstance(msg, dict):
+                    continue
+                if msg.get("type") == "api_response":
+                    req_id = msg.get("req_id")
+                    fut = self._pending.pop(req_id, None)
+                    if fut is not None and not fut.done():
+                        # body is JSON-encoded response dict
+                        try:
+                            body_dict = json.loads(msg.get("body", "{}"))
+                        except Exception:
+                            body_dict = {"ok": False, "error": "bad api_response body"}
+                        # OPT-05 Phase 2: 插件字段级压缩 (stdout/stderr 信封)
+                        # 在此解码，还原为纯文本 (decodeInbound 等价)。
+                        body_dict = decode_field_compression(body_dict)
+                        fut.set_result((msg.get("status", 0), body_dict))
+                    # else: late/unknown response, drop
+        except ConnectionClosed as e:
+            log.warning("wss closed: %s", e)
+        except Exception as e:
+            log.warning("wss reader error: %s", e)
+
+    async def _watchdog(self):
+        """Reconnect if the server goes silent."""
+        while not self._stop.is_set():
+            await asyncio.sleep(5)
+            if self._ws and time.time() - self._last_rx > self.WATCHDOG_SILENCE:
+                log.warning("wss watchdog: %.0fs silence, reconnecting",
+                            time.time() - self._last_rx)
+                try:
+                    await self._ws.close()
+                except Exception:
+                    pass
+                break
+
+    def _fail_all_pending(self, err):
+        for req_id, fut in list(self._pending.items()):
+            self._pending.pop(req_id, None)
+            if not fut.done():
+                fut.set_exception(RuntimeError(err))
+
+    async def _run(self):
+        """Maintain the channel forever with backoff."""
+        self._send_lock = asyncio.Lock()
+        self._stop = asyncio.Event()
+        backoff = 1
+        while not self._stop.is_set() and not self._shutdown:
+            try:
+                await self._connect_once()
+                backoff = 1
+                self._reader_task = asyncio.create_task(self._reader())
+                self._watchdog_task = asyncio.create_task(self._watchdog())
+                await self._reader_task  # ends on close/error
+            except Exception as e:
+                log.warning("wss connect/read failed: %s", e)
+            finally:
+                for t in (self._reader_task, self._watchdog_task):
+                    if t is not None:
+                        t.cancel()
+                self._fail_all_pending("wss reconnecting")
+                with self._lock:
+                    self._ws = None
+            if self._stop.is_set() or self._shutdown:
+                break
+            self.reconnects += 1
+            log.info("wss reconnect in %ss (attempt %d)", backoff,
+                     self.reconnects)
+            try:
+                await asyncio.wait_for(self._stop.wait(), timeout=backoff)
+                break  # stop was set
+            except asyncio.TimeoutError:
+                pass
+            backoff = min(backoff * 2, 30)
+
+    async def _async_request(self, method, path, body, timeout=None):
+        """Send one request over WSS. Runs in the loop thread."""
+        with self._lock:
+            ws = self._ws
+        if ws is None:
+            raise RuntimeError("wss not connected")
+        req_id = _new_req_id()
+        frame = {"type": "api_request", "req_id": req_id,
+                 "method": method, "path": path, "body": body}
+        loop = asyncio.get_running_loop()
+        fut = loop.create_future()
+        self._pending[req_id] = fut
+        try:
+            async with self._send_lock:
+                await ws.send(json.dumps(frame))
+            to = timeout or _read_timeout_for(body, path)
+            # Shield so timeout doesn't cancel the future itself
+            status, body_dict = await asyncio.wait_for(
+                asyncio.shield(fut), timeout=to)
+            # Convert body_dict back to bytes (Upstream.request contract)
+            body_bytes = json.dumps(body_dict).encode("utf-8")
+            return status, body_bytes
+        except asyncio.TimeoutError:
+            self._pending.pop(req_id, None)
+            raise TimeoutError(f"wss req {req_id} timed out after {to}s")
+        finally:
+            self._pending.pop(req_id, None)
+
+
+
+class Upstream:
+    """Pool of keep-alive HTTPS connections to the VPS (no SSH).
+
+    Holds min_size=4 .. max_size=16 pooled connections (Gemini-4 spec):
+    pre-warmed at startup, idle>45s discarded (nginx keepalive_timeout=65s
+    race), callers block up to 5s when exhausted.
+    """
+
+    def __init__(self, cfg):
+        self._cfg = cfg
+        proxy_host, proxy_port, proxy_auth = parse_proxy()
+        self._proxy = (proxy_host, proxy_port, proxy_auth)
+        ca = cfg["ca_cert_path"]
+        if not os.path.isfile(ca):
+            raise RuntimeError(f"CA cert not found: {ca}")
+        self._ctx = ssl.create_default_context(cafile=ca)
+        # TLS session resumption cache (Gemini-4 §3.3): shared by every
+        # pooled connection; thread-safe. 0-RTT is never enabled.
+        self.tls_cache = TLSSessionCache()
+        self._pool = ConnectionPool(
+            connect_fn=self._new_verified_conn,
+            min_size=4, max_size=16)
+        # OPT-03: WSS multiplex (primary); HTTPS pool is the fallback.
+        self._wss = None
+        self._wss_token = None
+
+    def _new_verified_conn(self):
+        """Create one connection: CONNECT+TLS, then a lightweight GET
+        /status to prove the full chain (401 also proves the link)."""
+        proxy_host, proxy_port, proxy_auth = self._proxy
+        c = ProxyHTTPSConnection(
+            self._cfg["vps_host"], self._cfg["vps_port"],
+            proxy_host=proxy_host, proxy_port=proxy_port,
+            proxy_auth=proxy_auth, sni=self._cfg["sni"],
+            context=self._ctx, timeout=TIMEOUT,
+            session_getter=self.tls_cache.get,
+            session_setter=self.tls_cache.set,
+            handshake_stats=self.tls_cache.note_handshake)
+        c.connect()
+        st = self.tls_cache.stats()
+        log.info("upstream connected (tls resumed=%d full=%d)",
+                 st["resumed"], st["full"])
+        headers = {
+            "Host": self._cfg["sni"],
+            "Connection": "keep-alive",
+            "User-Agent": "mused/1.0",
+        }
+        try:
+            c.request("GET", API_PREFIX + "/status", body=None,
+                      headers=headers)
+            resp = c.getresponse()
+            resp.read()  # drain fully so the socket is reusable
+        except Exception:
+            try:
+                c.close()
+            except Exception:
+                pass
+            raise
+        return c
+
+    def _init_wss(self, token):
+        """Lazily start the WSS control channel (once per process)."""
+        if self._wss is not None:
+            return
+        if not _HAS_WEBSOCKETS:
+            return
+        # OPT-03: WSS channel authenticates as the daemon (controller role)
+        # using the daemon's own token from token_file, NOT the per-request
+        # token (which may be empty for heartbeat/liveness probes).
+        daemon_token = token
+        try:
+            tf = self._cfg.get("token_file")
+            if tf and os.path.isfile(tf):
+                with open(tf, "r") as f:
+                    daemon_token = f.read().strip()
+        except Exception as e:
+            log.warning("cannot read daemon token file: %s", e)
+        if not daemon_token:
+            log.warning("no daemon token for wss, using https pool")
+            return
+        try:
+            self._wss = WssMux(self._cfg, daemon_token)
+            self._wss.start()
+            # Wait briefly for the channel; don't block startup on it.
+            if self._wss.wait_ready(timeout=8):
+                log.info("wss multiplex ready (https pool = fallback)")
+            else:
+                log.warning("wss not ready after 8s, using https pool")
+        except Exception as e:
+            log.warning("wss init failed, using https pool: %s", e)
+            self._wss = None
+
+    def _wss_request(self, token, method, path, body):
+        """Try the WSS channel. Returns (status, body) or raises."""
+        if self._wss is None:
+            self._init_wss(token)
+        if self._wss is None or not self._wss.is_connected():
+            raise RuntimeError("wss unavailable")
+        return self._wss.request(method, path, body)
+
+    def close(self):
+        if self._wss is not None:
+            try:
+                self._wss.stop()
+            except Exception:
+                pass
+            self._wss = None
+        self._pool.close_all()
+
+    def stats(self):
+        return self._pool.stats()
+
+    def request(self, token, method, path, body):
+        """Forward one request. Returns (status, body_bytes).
+
+        OPT-03: tries the WSS multiplex channel first; falls back to the
+        HTTPS pool on any WSS failure (preserves existing behavior).
+
+        If compress_enabled, request bodies >= 2KB are zlib-compressed
+        (Content-Encoding: deflate) before sending, and responses are
+        decompressed according to their Content-Encoding header.
+        Compression is end-to-end (VM <-> PC): the VPS passes the bytes
+        through untouched, so it costs the VPS zero CPU.
+        """
+        # OPT-03: WSS first, HTTPS fallback. The WSS path sends the raw
+        # body dict (no HTTP compression framing); the VPS api_request
+        # handler supports POST /cmd (other paths fall back to HTTPS).
+        try:
+            status, data = self._wss_request(token, method, path, body)
+            # VPS returns 404 for unsupported controller API paths;
+            # fall back to HTTPS for those.
+            try:
+                _d = json.loads(data.decode("utf-8"))
+                if status == 404 and "Unsupported controller API" in str(_d.get("error", "")):
+                    raise RuntimeError("wss: unsupported path, using https")
+            except (ValueError, UnicodeDecodeError):
+                pass
+            return status, data
+        except Exception as e:
+            log.debug("wss request failed (%s), falling back to https", e)
+        if not path.startswith("/"):
+            path = "/" + path
+        url = API_PREFIX + path
+        payload = None
+        headers = {
+            "Host": self._cfg["sni"],
+            "X-Bridge-Token": token,
+            "Connection": "keep-alive",
+            "User-Agent": "mused/1.0",
+        }
+        if body is not None:
+            payload = json.dumps(body).encode("utf-8")
+            headers["Content-Type"] = "application/json"
+            if self._cfg.get("compress_enabled", True):
+                payload, comp_hdrs = request_headers(payload)
+                headers.update(comp_hdrs)
+            headers["Content-Length"] = str(len(payload))
+        pc = self._pool.get_connection()
+        # Per-request read timeout: the pooled socket defaults to TIMEOUT
+        # (10s), but /cmd//batch callers may request up to 600s via the
+        # body's "timeout" field. Extend the socket read deadline so slow
+        # or large responses aren't cut off at 10s. (Bug T87, 2026-10-19)
+        read_timeout = TIMEOUT
+        _timeout_derived = False
+        if isinstance(body, dict):
+            try:
+                _t = body.get("timeout")
+                if _t is None and isinstance(body.get("commands"), list):
+                    _t = max(
+                        (int(c.get("timeout", 60)) for c in body["commands"]
+                         if isinstance(c, dict)),
+                        default=60,
+                    )
+                if _t is not None:
+                    read_timeout = min(max(int(_t), 1), 600) + 5
+                    _timeout_derived = True
+            except (ValueError, TypeError):
+                pass
+        if not _timeout_derived and path in ("/cmd", "/batch", "/file"):
+            # OPT-03 (T87 completion): no explicit timeout derivable ->
+            # the PC-side default execution timeout is 60s; cutting the
+            # HTTPS read at 10s would abandon (not stop) slow commands.
+            read_timeout = 65
+        try:
+            pc.conn.request(method, url, body=payload, headers=headers)
+            # Set extended timeout BEFORE getresponse(): the 10s default
+            # applies to waiting for response headers too, not just body.
+            _orig_sock_timeout = pc.conn.sock.gettimeout()
+            pc.conn.sock.settimeout(read_timeout)
+            try:
+                resp = pc.conn.getresponse()
+                data = resp.read()  # drain fully so the socket is reusable
+            finally:
+                pc.conn.sock.settimeout(_orig_sock_timeout)
+            # server asked to close: don't return a dead conn to the pool
+            broken = bool(getattr(resp, "will_close", False))
+            self._pool.return_connection(pc, is_broken=broken)
+            if self._cfg.get("compress_enabled", True):
+                try:
+                    data = decompress(data,
+                                      response_encoding(resp.headers))
+                except (ValueError, zlib.error) as e:
+                    # Corrupt deflate must never be delivered silently.
+                    # HTTP framing (Content-Length) guarantees the message
+                    # is complete, so the payload itself is bad data.
+                    log.warning("decompress failed for %s %s: %s",
+                                method, path, e)
+                    raise RuntimeError(
+                        f"response decompress failed: {e}") from e
+            # OPT-05 Phase 2: 字段级解压 (插件 decodeInbound 等价)。
+            # 协议正确性、非可选开关: 即使 compress_enabled=False 也执行。
+            data = decode_field_compression_bytes(data)
+            return resp.status, data
+        except (http.client.HTTPException, OSError, ssl.SSLError):
+            # connection went stale; drop it so next call rebuilds
+            self._pool.return_connection(pc, is_broken=True)
+            raise
+
+
+# ------------------------------------------------------- OPT-03 dedup (Layer 1)
+
+_IDEM_KEY_RE = re.compile(r"^[A-Za-z0-9._:-]{8,128}$")
+IDEM_PATHS = ("/cmd", "/batch", "/file")
+IDEM_MAX_ENTRIES = 512
+IDEM_TTL = 600            # s, completed-entry lifetime
+IDEM_BIG_TTL = 30         # s, for results > IDEM_BIG_BODY (bounded memory)
+IDEM_BIG_BODY = 1024 * 1024  # chars (~bytes) above which the short TTL applies
+IDEM_WAIT_TIMEOUT = 660   # s, single-flight wait cap for duplicates
+
+
+def _idem_key_for(method, path, body):
+    """The idempotency key of a request, or None if dedup doesn't apply."""
+    if method != "POST" or path not in IDEM_PATHS or not isinstance(body, dict):
+        return None
+    k = body.get("idem_key")
+    if isinstance(k, str) and _IDEM_KEY_RE.match(k):
+        return k
+    return None
+
+
+class DedupCache:
+    """Result cache + single-flight keyed by idem_key (OPT-03 Layer 1).
+
+    First arrival executes (owner); duplicates arriving in flight wait for
+    the owner and replay its result; duplicates after completion (within
+    TTL) replay the cached (status, body) verbatim. If the owner's call
+    raises, the entry is dropped and one waiter takes over as the new
+    owner (such failures are almost always link errors where the command
+    never reached the PC, so re-execution is the desired outcome).
+    Completed entries: max IDEM_MAX_ENTRIES (oldest-done evicted first,
+    in-flight never evicted), TTL IDEM_TTL (IDEM_BIG_TTL for big bodies).
+    In-memory only: a mused restart clears it (see OPT03 doc section 3).
+    """
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._entries = OrderedDict()
+
+    def execute(self, key, fn):
+        """Run fn() -> (status, body_text) at most once per key window."""
+        while True:
+            with self._lock:
+                ent = self._entries.get(key)
+                if ent is not None and ent["state"] == "done":
+                    if time.time() <= ent["expires"]:
+                        self._entries.move_to_end(key)
+                        return ent["status"], ent["body"]
+                    del self._entries[key]
+                    ent = None
+                if ent is None:
+                    ent = {"state": "inflight", "event": threading.Event(),
+                           "status": 0, "body": "", "expires": 0.0}
+                    self._entries[key] = ent
+                    owner = True
+                else:
+                    owner = False
+            if owner:
+                try:
+                    status, body = fn()
+                except BaseException:
+                    with self._lock:
+                        if self._entries.get(key) is ent:
+                            del self._entries[key]
+                    ent["event"].set()
+                    raise
+                with self._lock:
+                    ent["state"] = "done"
+                    ent["status"] = status
+                    ent["body"] = body
+                    ttl = IDEM_BIG_TTL if len(body) > IDEM_BIG_BODY else IDEM_TTL
+                    ent["expires"] = time.time() + ttl
+                    self._prune_locked()
+                ent["event"].set()
+                return status, body
+            if not ent["event"].wait(IDEM_WAIT_TIMEOUT):
+                raise TimeoutError(
+                    "idempotent duplicate: original request still in flight")
+            # loop: entry now done (replay) or dropped (take over as owner)
+
+    def _prune_locked(self):
+        now = time.time()
+        for k in list(self._entries.keys()):
+            e = self._entries[k]
+            if e["state"] == "done" and now > e["expires"]:
+                del self._entries[k]
+        while len(self._entries) > IDEM_MAX_ENTRIES:
+            for k, e in self._entries.items():
+                if e["state"] == "done":
+                    del self._entries[k]
+                    break
+            else:
+                break
+
+
+_DEDUP = DedupCache()
+
+
+# ---------------------------------------------------------------- socket IPC
+
+def send_frame(sock, obj):
+    blob = json.dumps(obj).encode("utf-8")
+    sock.sendall(HDR.pack(len(blob)) + blob)
+
+
+def recv_frame(sock):
+    hdr = b""
+    while len(hdr) < HDR.size:
+        chunk = sock.recv(HDR.size - len(hdr))
+        if not chunk:
+            raise ConnectionError("client closed")
+        hdr += chunk
+    (n,) = HDR.unpack(hdr)
+    if n > 16 * 1024 * 1024:
+        raise ValueError("frame too large")
+    buf = b""
+    while len(buf) < n:
+        chunk = sock.recv(min(65536, n - len(buf)))
+        if not chunk:
+            raise ConnectionError("client closed mid-frame")
+        buf += chunk
+    return json.loads(buf.decode("utf-8"))
+
+
+def handle_client(client_sock, upstream, batcher=None):
+    try:
+        req = recv_frame(client_sock)
+        token = req.get("token", "")
+        method = req.get("method", "GET").upper()
+        path = req.get("path", "/status")
+        body = req.get("body")
+        try:
+            if batcher is not None:
+                status, body_text = _via_batcher(batcher, req,
+                                                 token, method, path, body)
+            else:
+                def _do_upstream():
+                    st, data = upstream.request(token, method, path, body)
+                    return st, data.decode("utf-8", "replace")
+
+                # OPT-03 Layer 1: idempotent dedup (see DedupCache). The
+                # batcher path is excluded (it has its own request_id
+                # semantics; microbatch is disabled in production).
+                ikey = _idem_key_for(method, path, body)
+                if ikey is not None:
+                    status, body_text = _DEDUP.execute(ikey, _do_upstream)
+                else:
+                    status, body_text = _do_upstream()
+            send_frame(client_sock, {"status": status, "body": body_text})
+        except Exception as e:
+            log.warning("upstream error for %s %s: %s", method, path, e)
+            send_frame(client_sock,
+                       {"status": 0, "body": "",
+                        "error": f"upstream: {type(e).__name__}: {e}"})
+    except Exception as e:
+        try:
+            send_frame(client_sock, {"status": 0, "body": "",
+                                     "error": f"bad request: {e}"})
+        except Exception:
+            pass
+    finally:
+        client_sock.close()
+
+
+def _via_batcher(batcher, req, token, method, path, body):
+    """Route one socket request through the MicroBatcher.
+
+    Optional socket fields: "target" (else taken from body["target"]),
+    "batchable" (bool; else inferred via is_read_only), "request_id".
+    """
+    target = req.get("target")
+    if target is None and isinstance(body, dict):
+        target = body.get("target")
+    batchable = req.get("batchable")
+    if batchable is None:
+        batchable = is_read_only(method, path, body)
+    return batcher.submit(token, target, method, path, body,
+                          batchable=bool(batchable),
+                          request_id=req.get("request_id"))
+
+
+def heartbeat_loop(upstream, stop_event, interval):
+    backoff = 1
+    while not stop_event.is_set():
+        try:
+            # token not needed for liveness: 401 also proves the link
+            upstream.request("", "GET", "/status", None)
+            backoff = 1  # link alive (even 401 means TLS+nginx+bridge OK)
+        except Exception as e:
+            log.warning("heartbeat failed: %s", e)
+            # NOTE (2026-10-21 hotfix): do NOT close the upstream client here.
+            # UpstreamClient.close() permanently shuts the HTTPS pool
+            # (ConnectionPool._closed, never reopened) and tears down the WSS
+            # mux -- turning ONE transient probe failure into a permanent
+            # outage until daemon restart ("connection pool is closed").
+            # Broken pooled connections are already discarded per-request
+            # (return_connection(is_broken=True)) and idle ones by staleness;
+            # WssMux self-heals via its watchdog/exp-backoff reconnect.
+            # So: log, back off, and let the next probe decide.
+            stop_event.wait(min(backoff, BACKOFF_CAP))
+            backoff = min(backoff * 2, BACKOFF_CAP)
+            continue
+        stop_event.wait(interval)
+
+
+# ---------------------------------------------------------------- main
+
+def main():
+    setup_logging()  # default INFO first so config-load warnings are visible
+    cfg = load_config()
+    level = getattr(logging, str(cfg.get("log_level", "INFO")).upper(), None)
+    if isinstance(level, int):
+        logging.getLogger().setLevel(level)
+    log.info("mused starting (vps=%s:%s sni=%s socket=%s)",
+             cfg["vps_host"], cfg["vps_port"], cfg["sni"],
+             cfg["socket_path"])
+
+    try:
+        upstream = Upstream(cfg)
+    except Exception as e:
+        log.error("cannot initialize upstream: %s", e)
+        return 1
+
+    batcher = None
+    if cfg.get("microbatch_enabled"):
+        if MicroBatcher is None:
+            log.error("microbatch_enabled but microbatch.py not importable")
+            return 1
+
+        def _send_fn(tok, m, p, b):
+            status, data = upstream.request(tok, m, p, b)
+            return status, data.decode("utf-8", "replace")
+
+        batcher = MicroBatcher(_send_fn)
+        log.info("microbatch enabled (1.5ms window, max 10/batch, 64KB cap)")
+
+    # warm the connection at startup so the first real request is fast
+    try:
+        upstream.request("", "GET", "/status", None)
+        log.info("upstream warm OK")
+    except Exception as e:
+        log.warning("initial upstream connect failed: %s", e)
+
+    stop_event = threading.Event()
+    srv_holder = {}
+
+    def shutdown(signum, _frame):
+        sig = "SIGTERM" if signum == signal.SIGTERM else "SIGINT"
+        log.info("received %s, shutting down", sig)
+        stop_event.set()
+        srv = srv_holder.get("srv")
+        if srv is not None:
+            try:
+                srv.close()
+            except Exception:
+                pass
+
+    signal.signal(signal.SIGTERM, shutdown)
+    signal.signal(signal.SIGINT, shutdown)
+
+    hb = threading.Thread(target=heartbeat_loop,
+                          args=(upstream, stop_event,
+                                cfg["heartbeat_interval"]),
+                          daemon=True, name="heartbeat")
+    hb.start()
+
+    sock_path = cfg["socket_path"]
+    try:
+        os.unlink(sock_path)
+    except FileNotFoundError:
+        pass
+    srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    srv_holder["srv"] = srv
+    try:
+        srv.bind(sock_path)
+    except OSError as e:
+        log.error("cannot bind %s: %s", sock_path, e)
+        return 1
+    os.chmod(sock_path, 0o600)
+    srv.listen(64)
+    log.info("listening on %s", sock_path)
+
+    try:
+        while not stop_event.is_set():
+            try:
+                srv.settimeout(1.0)
+                client, _ = srv.accept()
+            except socket.timeout:
+                continue
+            except OSError:
+                break  # socket closed by shutdown handler
+            t = threading.Thread(target=handle_client,
+                                 args=(client, upstream, batcher), daemon=True)
+            t.start()
+    finally:
+        stop_event.set()
+        hb.join(timeout=5)
+        try:
+            srv.close()
+        except Exception:
+            pass
+        upstream.close()
+        try:
+            os.unlink(sock_path)
+            log.info("removed socket %s", sock_path)
+        except FileNotFoundError:
+            pass
+        log.info("mused stopped")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

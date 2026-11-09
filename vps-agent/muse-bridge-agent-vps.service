@@ -1,0 +1,26 @@
+[Unit]
+Description=Muse Bridge agent — VPS endpoint ${VPS_NAME} (Scheme A)
+Documentation=file:///opt/muse-bridge-agent/README.md
+After=network-online.target muse-bridge.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /opt/muse-bridge-agent/vps-agent.py --config /etc/muse-bridge-agent/config.json
+Restart=on-failure
+RestartSec=5
+# Exit code 2 = token rejected / missing: park instead of looping.
+RestartPreventExitStatus=2
+# Isolation: this unit is independent of muse-bridge.service and of every
+# gateway service. Resource limits keep the steward from starving the
+# production gateway on this 4-core / 2 GB host.
+CPUQuota=50%
+MemoryMax=256M
+TasksMax=64
+Nice=5
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=muse-bridge-agent
+
+[Install]
+WantedBy=multi-user.target

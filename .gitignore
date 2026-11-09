@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+*token*
+controllers.json
+proxy.env
+*.key
+*-key.pem
+*.log
+*.tar.gz

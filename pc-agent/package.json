@@ -1,0 +1,1 @@
+{"dependencies":{"ws":"^8.22.0"},"description":"Headless Muse Bridge agent for ${PC_NAME} (plugin core, no VS Code)","main":"agent.js","name":"muse-bridge-agent","private":true,"version":"1.2.12-headless.1"}

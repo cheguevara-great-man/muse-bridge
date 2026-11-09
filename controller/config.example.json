@@ -1,0 +1,1 @@
+{"ca_cert_path":"/home/hatch/.local/share/muse-bridge/vps-root-ca.pem","compress_enabled":false,"heartbeat_interval":30,"log_level":"INFO","microbatch_enabled":false,"sni":"${VPS_SNI}","socket_path":"/tmp/mused.sock","token_file":"/home/hatch/.config/mused/token","vps_host":"${VPS_IP}","vps_port":443}

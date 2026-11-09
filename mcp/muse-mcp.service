@@ -1,0 +1,34 @@
+[Unit]
+Description=Muse Bridge MCP service (Scheme B: MCP Streamable HTTP + OAuth front end for the relay, executes nothing itself)
+After=network-online.target muse-bridge.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /opt/muse-mcp/muse-mcp.py
+Restart=on-failure
+RestartSec=3
+User=root
+Environment=MUSE_MCP_LISTEN=127.0.0.1:8472
+Environment=MUSE_MCP_ISSUER=https://${VPS_SNI}
+Environment=MUSE_MCP_STATE=/var/lib/muse-mcp/state.json
+Environment=MUSE_MCP_BRIDGE_TOKEN_FILE=/etc/muse-bridge/mcp-bridge-token
+Environment=MUSE_MCP_RELAY=http://127.0.0.1:8471
+Environment=MUSE_MCP_TARGET=${PC_NAME}
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/muse-mcp
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+CapabilityBoundingSet=
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+MemoryMax=256M
+TasksMax=64
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,1 @@
+{"<sha256-of-controller-token>":{"created":"YYYY-MM-DD","enabled":true,"label":"main controller","muse":"muse-main","pcs":["${PC_NAME}","${VPS_NAME}"]}}
